@@ -1,0 +1,315 @@
+// compass_cs.cs — компас с калибровкой на C# (WPF)
+
+using System;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Threading;
+using System.IO;
+using System.Text.Json;
+using Microsoft.Win32;
+
+namespace CompassWPF
+{
+    public partial class MainWindow : Window
+    {
+        private double angle = 0;
+        private double offset = 0;
+        private bool calibrated = false;
+        private bool simulating = false;
+        private DispatcherTimer timer;
+        private Random rand = new Random();
+        private string configFile = "compass_config.json";
+
+        private Canvas compassCanvas;
+        private RotateTransform rotateTransform;
+        private Label infoLabel, statusLabel;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            LoadConfig();
+            CreateUI();
+            UpdateDisplay();
+        }
+
+        private void CreateUI()
+        {
+            Title = "🧭 CompassCalibrator — C#";
+            Width = 600;
+            Height = 680;
+            var grid = new Grid();
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // Панель управления
+            var ctrlPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(5) };
+            var readBtn = new Button { Content = "Прочитать" };
+            var calibrateBtn = new Button { Content = "Калибровка" };
+            var resetBtn = new Button { Content = "Сброс" };
+            var simBtn = new Button { Content = "Симуляция" };
+            var manualBtn = new Button { Content = "Ввести азимут" };
+            ctrlPanel.Children.Add(readBtn);
+            ctrlPanel.Children.Add(calibrateBtn);
+            ctrlPanel.Children.Add(resetBtn);
+            ctrlPanel.Children.Add(simBtn);
+            ctrlPanel.Children.Add(manualBtn);
+            Grid.SetRow(ctrlPanel, 0);
+            grid.Children.Add(ctrlPanel);
+
+            // Canvas для компаса
+            compassCanvas = new Canvas { Background = Brushes.White };
+            // Будем рисовать в коде, используя RotateTransform для стрелки
+            Grid.SetRow(compassCanvas, 1);
+            grid.Children.Add(compassCanvas);
+            // Рисуем статический компас при загрузке
+            compassCanvas.SizeChanged += (s, e) => DrawCompass();
+            DrawCompass();
+
+            // Информация
+            infoLabel = new Label { Content = "Азимут: 0° (С)", HorizontalAlignment = HorizontalAlignment.Center, FontSize = 16 };
+            Grid.SetRow(infoLabel, 2);
+            grid.Children.Add(infoLabel);
+
+            statusLabel = new Label { Content = "Готов", HorizontalAlignment = HorizontalAlignment.Center };
+            Grid.SetRow(statusLabel, 3);
+            grid.Children.Add(statusLabel);
+
+            Content = grid;
+
+            readBtn.Click += (s, e) => ReadAngle();
+            calibrateBtn.Click += (s, e) => Calibrate();
+            resetBtn.Click += (s, e) => Reset();
+            simBtn.Click += (s, e) => ToggleSimulation();
+            manualBtn.Click += (s, e) => ManualInput();
+
+            timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            timer.Tick += (s, e) => Simulate();
+        }
+
+        private void DrawCompass()
+        {
+            // Рисование круга и делений на Canvas
+            compassCanvas.Children.Clear();
+            double w = compassCanvas.ActualWidth;
+            double h = compassCanvas.ActualHeight;
+            if (w < 10 || h < 10) return;
+            double cx = w/2, cy = h/2;
+            double r = Math.Min(w, h)/2 - 20;
+            // Круг
+            var ellipse = new System.Windows.Shapes.Ellipse();
+            ellipse.Width = 2*r;
+            ellipse.Height = 2*r;
+            Canvas.SetLeft(ellipse, cx-r);
+            Canvas.SetTop(ellipse, cy-r);
+            ellipse.Stroke = Brushes.Black;
+            ellipse.StrokeThickness = 2;
+            compassCanvas.Children.Add(ellipse);
+
+            // Деления
+            for (int deg = 0; deg < 360; deg += 30) {
+                double rad = deg * Math.PI / 180.0;
+                double x1 = cx + (r-20) * Math.Sin(rad);
+                double y1 = cy - (r-20) * Math.Cos(rad);
+                double x2 = cx + r * Math.Sin(rad);
+                double y2 = cy - r * Math.Cos(rad);
+                var line = new System.Windows.Shapes.Line();
+                line.X1 = x1; line.Y1 = y1; line.X2 = x2; line.Y2 = y2;
+                line.Stroke = Brushes.Black;
+                line.StrokeThickness = 2;
+                compassCanvas.Children.Add(line);
+                if (deg % 90 == 0) {
+                    string label;
+                    if (deg == 0) label = "N";
+                    else if (deg == 90) label = "E";
+                    else if (deg == 180) label = "S";
+                    else label = "W";
+                    var tb = new TextBlock();
+                    tb.Text = label;
+                    tb.FontSize = 14;
+                    tb.FontWeight = FontWeights.Bold;
+                    tb.Foreground = Brushes.Black;
+                    double lx = cx + (r-40) * Math.Sin(rad);
+                    double ly = cy - (r-40) * Math.Cos(rad);
+                    Canvas.SetLeft(tb, lx - 10);
+                    Canvas.SetTop(tb, ly - 8);
+                    compassCanvas.Children.Add(tb);
+                }
+            }
+            // Стрелка (используем RotateTransform)
+            // Создаём Group с линиями
+            var arrowGroup = new System.Windows.Shapes.Path();
+            // Сформируем фигуру стрелки (будет вращаться)
+            // Северная стрелка (красная линия)
+            var northLine = new System.Windows.Shapes.Line();
+            northLine.X1 = cx + 20 * Math.Sin(0);
+            northLine.Y1 = cy - 20 * Math.Cos(0);
+            northLine.X2 = cx + 150 * Math.Sin(0);
+            northLine.Y2 = cy - 150 * Math.Cos(0);
+            northLine.Stroke = Brushes.Red;
+            northLine.StrokeThickness = 6;
+            // Южная стрелка (синяя линия)
+            var southLine = new System.Windows.Shapes.Line();
+            southLine.X1 = cx - 20 * Math.Sin(0);
+            southLine.Y1 = cy + 20 * Math.Cos(0);
+            southLine.X2 = cx - 90 * Math.Sin(0);
+            southLine.Y2 = cy + 90 * Math.Cos(0);
+            southLine.Stroke = Brushes.Blue;
+            southLine.StrokeThickness = 4;
+            // Наконечник
+            var head = new System.Windows.Shapes.Polygon();
+            head.Fill = Brushes.Red;
+            // ... (формируем точки)
+            // Для простоты будем вращать только стрелку, а наконечник добавим отдельно.
+
+            // Упростим: создадим только линию и повернём её, а наконечник нарисуем как треугольник.
+            var arrowLine = new System.Windows.Shapes.Line();
+            arrowLine.X1 = cx;
+            arrowLine.Y1 = cy;
+            arrowLine.X2 = cx + 150 * Math.Sin(0);
+            arrowLine.Y2 = cy - 150 * Math.Cos(0);
+            arrowLine.Stroke = Brushes.Red;
+            arrowLine.StrokeThickness = 6;
+            var arrowHead = new System.Windows.Shapes.Polygon();
+            arrowHead.Fill = Brushes.Red;
+            // Точки для треугольника
+            double len = 150;
+            double rad = 0;
+            double x2 = cx + len * Math.Sin(rad);
+            double y2 = cy - len * Math.Cos(rad);
+            var pts = new PointCollection();
+            pts.Add(new Point(x2, y2));
+            pts.Add(new Point(x2 - 15*Math.Cos(rad-0.4) + 15*Math.Sin(rad-0.4), y2 - 15*Math.Sin(rad-0.4) - 15*Math.Cos(rad-0.4)));
+            pts.Add(new Point(x2 - 15*Math.Cos(rad+0.4) - 15*Math.Sin(rad+0.4), y2 - 15*Math.Sin(rad+0.4) + 15*Math.Cos(rad+0.4)));
+            arrowHead.Points = pts;
+
+            // Группируем для поворота
+            var group = new TransformGroup();
+            var rotate = new RotateTransform(0, cx, cy);
+            group.Children.Add(rotate);
+            // Применяем к линии и треугольнику
+            arrowLine.RenderTransform = rotate;
+            arrowHead.RenderTransform = rotate;
+            compassCanvas.Children.Add(arrowLine);
+            compassCanvas.Children.Add(arrowHead);
+            // Сохраняем ссылки для обновления
+            rotateTransform = rotate;
+            // Добавляем линии для южного направления отдельно (не вращаем, они фиксированы?) — нет, тоже вращаются, упростим: только одна стрелка.
+            // Вместо этого нарисуем всё в обработчике UpdateDisplay.
+        }
+
+        private void UpdateDisplay()
+        {
+            // Обновление стрелки
+            double displayAngle = (angle + offset) % 360;
+            if (displayAngle < 0) displayAngle += 360;
+            if (rotateTransform != null)
+                rotateTransform.Angle = displayAngle;
+            string dir = DirectionName(displayAngle);
+            infoLabel.Content = $"Азимут: {displayAngle:F1}° ({dir})";
+            statusLabel.Content = $"Текущий азимут: {displayAngle:F1}°";
+        }
+
+        private string DirectionName(double deg)
+        {
+            string[] dirs = { "С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ" };
+            int idx = (int)((deg + 22.5) / 45) % 8;
+            return dirs[idx];
+        }
+
+        private void ReadAngle()
+        {
+            if (!simulating)
+                angle = (angle + rand.NextDouble()*10 - 5) % 360;
+            if (angle < 0) angle += 360;
+            UpdateDisplay();
+        }
+
+        private void Calibrate()
+        {
+            statusLabel.Content = "Калибровка... (имитация)";
+            double sum = 0;
+            for (int i = 0; i < 10; i++) sum += rand.NextDouble()*360;
+            double avg = sum / 10;
+            offset = (0 - avg) % 360;
+            if (offset < 0) offset += 360;
+            calibrated = true;
+            statusLabel.Content = $"Калибровка завершена. Смещение: {offset:F2}°";
+            SaveConfig();
+            UpdateDisplay();
+        }
+
+        private void Reset()
+        {
+            offset = 0;
+            calibrated = false;
+            angle = 0;
+            statusLabel.Content = "Сброшено";
+            UpdateDisplay();
+        }
+
+        private void ToggleSimulation()
+        {
+            simulating = !simulating;
+            if (simulating)
+            {
+                timer.Start();
+                statusLabel.Content = "Симуляция включена";
+            }
+            else
+            {
+                timer.Stop();
+                statusLabel.Content = "Симуляция выключена";
+            }
+        }
+
+        private void Simulate()
+        {
+            angle = (angle + 0.5) % 360;
+            UpdateDisplay();
+        }
+
+        private void ManualInput()
+        {
+            string input = Microsoft.VisualBasic.Interaction.InputBox("Введите азимут (0-360):", "Ввод азимута", angle.ToString("F1"));
+            if (double.TryParse(input, out double val))
+            {
+                angle = val % 360;
+                if (angle < 0) angle += 360;
+                UpdateDisplay();
+                statusLabel.Content = $"Азимут установлен: {angle:F1}°";
+            }
+        }
+
+        private void LoadConfig()
+        {
+            if (File.Exists(configFile))
+            {
+                string json = File.ReadAllText(configFile);
+                var data = JsonSerializer.Deserialize<Dictionary<string, object>>(json);
+                if (data != null)
+                {
+                    offset = Convert.ToDouble(data["offset"]);
+                    calibrated = Convert.ToBoolean(data["calibrated"]);
+                }
+            }
+        }
+
+        private void SaveConfig()
+        {
+            var data = new { offset, calibrated };
+            string json = JsonSerializer.Serialize(data);
+            File.WriteAllText(configFile, json);
+        }
+
+        [STAThread]
+        static void Main()
+        {
+            var app = new Application();
+            app.Run(new MainWindow());
+        }
+    }
+}
